@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rollback Engine</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            font-family: "Segoe UI", sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+            background: #08101d;
+            color: #e6f0ff;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+
+        .hud {
+            position: fixed;
+            top: 20px;
+            left: 24px;
+            min-width: 235px;
+            padding: 14px 16px;
+            border: 1px solid rgba(140, 190, 255, 0.25);
+            border-radius: 10px;
+            background: rgba(8, 16, 29, 0.82);
+            box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+            line-height: 1.6;
+        }
+
+        .hp-track {
+            width: 190px;
+            height: 10px;
+            margin: 4px 0 6px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: #273449;
+        }
+
+        #hp-fill {
+            width: 100%;
+            height: 100%;
+            background: #38d17b;
+            transition: width 0.18s ease, background 0.18s ease;
+        }
+
+        .status {
+            position: fixed;
+            top: 24px;
+            right: 26px;
+            color: #78edaa;
+            font-weight: 600;
+        }
+
+        .status.offline {
+            color: #ff7d7d;
+        }
+
+        .waiting {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            padding: 14px 22px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            background: rgba(8, 16, 29, 0.86);
+            color: #d7e5ff;
+            transform: translate(-50%, -50%);
+        }
+
+        .controls {
+            position: fixed;
+            bottom: 22px;
+            left: 50%;
+            color: #aabbd5;
+            transform: translateX(-50%);
+        }
+
+        #damage {
+            position: fixed;
+            pointer-events: none;
+            color: #ff6565;
+            font-size: 24px;
+            font-weight: 800;
+            opacity: 0;
+            text-shadow: 0 2px 4px #000;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="game"></canvas>
+    <section class="hud">
+        <button id="start" type="button">Start / Reset simulation</button>
+        <div>HP <span id="hp-value">100</span></div>
+        <div class="hp-track"><div id="hp-fill"></div></div>
+        <div>Tick: <span id="tick">0</span></div>
+        <div>Position: (<span id="x">0</span>, <span id="y">0</span>)</div>
+        <div>Command: <span id="label">idle</span></div>
+    </section>
+    <div id="status" class="status">Server offline</div>
+    <div id="waiting" class="waiting">Click Start to run the simulation</div>
+    <div class="controls">W A S D: move&nbsp;&nbsp;&nbsp; SPACE: take hit (-10 HP)</div>
+    <div id="damage">-10</div>
+
+    <script>
+        const canvas = document.getElementById("game");
+        const context = canvas.getContext("2d");
+        const statusElement = document.getElementById("status");
+        const waitingElement = document.getElementById("waiting");
+        const damageElement = document.getElementById("damage");
+        const hpFill = document.getElementById("hp-fill");
+        const hpValue = document.getElementById("hp-value");
+        const tickValue = document.getElementById("tick");
+        const xValue = document.getElementById("x");
+        const yValue = document.getElementById("y");
+        const labelValue = document.getElementById("label");
+
+        const heldKeys = new Set();
+        const keyLabels = new Map([
+            ["KeyW", "w"],
+            ["ArrowUp", "w"],
+            ["KeyA", "a"],
+            ["ArrowLeft", "a"],
+            ["KeyS", "s"],
+            ["ArrowDown", "s"],
+            ["KeyD", "d"],
+            ["ArrowRight", "d"]
+        ]);
+
+        let canvasWidth = 0;
+        let canvasHeight = 0;
+        let targetX = 0;
+        let targetY = 0;
+        let drawnX = 0;
+        let drawnY = 0;
+        let lastCommand = "idle";
+        let lastSentMovement = "idle";
+        let flashUntil = 0;
+        let damageUntil = 0;
+
+        function resizeCanvas() {
+            const scale = window.devicePixelRatio || 1;
+            canvasWidth = window.innerWidth;
+            canvasHeight = window.innerHeight;
+            canvas.width = Math.round(canvasWidth * scale);
+            canvas.height = Math.round(canvasHeight * scale);
+            context.setTransform(scale, 0, 0, scale, 0, 0);
+        }
+
+        function setConnection(connected) {
+            statusElement.textContent = connected ? "Connected" : "Server offline";
+            statusElement.classList.toggle("offline", !connected);
+        }
+
+        async function sendInput(label) {
+            try {
+                const response = await fetch("/input", {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain" },
+                    body: label
+                });
+                if (!response.ok) {
+                    throw new Error("input rejected");
+                }
+                setConnection(true);
+            } catch (error) {
+                setConnection(false);
+            }
+        }
+
+        function currentMovementLabel() {
+            let label = "idle";
+            for (const key of heldKeys) {
+                label = keyLabels.get(key);
+            }
+            return label;
+        }
+
+        function updateMovementInput() {
+            const label = currentMovementLabel();
+            if (label !== lastSentMovement) {
+                lastSentMovement = label;
+                sendInput(label);
+            }
+        }
+
+        function showHitFeedback() {
+            flashUntil = performance.now() + 180;
+            damageUntil = performance.now() + 650;
+        }
+
+        async function sendHit() {
+            showHitFeedback();
+            await sendInput("attack10");
+        }
+
+        async function pollState() {
+            try {
+                const response = await fetch("/state", { cache: "no-store" });
+                if (!response.ok) {
+                    throw new Error("state unavailable");
+                }
+                const state = await response.json();
+                setConnection(true);
+                targetX = Number(state.x) || 0;
+                targetY = Number(state.y) || 0;
+                lastCommand = state.label || "idle";
+                tickValue.textContent = state.tick;
+                xValue.textContent = targetX.toFixed(1);
+                yValue.textContent = targetY.toFixed(1);
+                labelValue.textContent = lastCommand;
+                const hp = Math.max(0, Math.min(100, Number(state.hp) || 0));
+                hpValue.textContent = hp;
+                hpFill.style.width = hp + "%";
+                hpFill.style.background =
+                    "hsl(" + Math.round(hp * 1.2) + ", 75%, 52%)";
+                waitingElement.hidden = Boolean(state.running);
+            } catch (error) {
+                setConnection(false);
+            }
+        }
+
+        function drawGrid() {
+            const gridSize = 48;
+            const offsetX = ((-drawnX * gridSize) % gridSize + gridSize) % gridSize;
+            const offsetY = ((drawnY * gridSize) % gridSize + gridSize) % gridSize;
+            context.strokeStyle = "rgba(112, 157, 207, 0.12)";
+            context.lineWidth = 1;
+            context.beginPath();
+            for (let x = offsetX; x < canvasWidth; x += gridSize) {
+                context.moveTo(x, 0);
+                context.lineTo(x, canvasHeight);
+            }
+            for (let y = offsetY; y < canvasHeight; y += gridSize) {
+                context.moveTo(0, y);
+                context.lineTo(canvasWidth, y);
+            }
+            context.stroke();
+        }
+
+        function drawPlayer() {
+            const playerX = canvasWidth / 2;
+            const playerY = canvasHeight / 2;
+            context.fillStyle = "#58a6ff";
+            context.shadowColor = "rgba(88, 166, 255, 0.65)";
+            context.shadowBlur = 18;
+            context.beginPath();
+            context.roundRect(playerX - 18, playerY - 18, 36, 36, 9);
+            context.fill();
+            context.shadowBlur = 0;
+            context.fillStyle = "#eaf4ff";
+            context.font = "12px Segoe UI";
+            context.textAlign = "center";
+            context.fillText("Player1", playerX, playerY - 28);
+        }
+
+        function drawFrame(timestamp) {
+            drawnX += (targetX - drawnX) * 0.12;
+            drawnY += (targetY - drawnY) * 0.12;
+            context.fillStyle = "#08101d";
+            context.fillRect(0, 0, canvasWidth, canvasHeight);
+            drawGrid();
+            drawPlayer();
+
+            if (timestamp < damageUntil) {
+                damageElement.style.left = canvasWidth / 2 + 24 + "px";
+                damageElement.style.top = canvasHeight / 2 - 36 + "px";
+                damageElement.style.opacity = String(
+                    Math.min(1, (damageUntil - timestamp) / 300));
+            } else {
+                damageElement.style.opacity = "0";
+            }
+            if (timestamp < flashUntil) {
+                context.fillStyle = "rgba(255, 35, 35, 0.2)";
+                context.fillRect(0, 0, canvasWidth, canvasHeight);
+            }
+            requestAnimationFrame(drawFrame);
+        }
+
+        window.addEventListener("resize", resizeCanvas);
+        window.addEventListener("keydown", (event) => {
+            if (keyLabels.has(event.code)) {
+                event.preventDefault();
+                if (!event.repeat) {
+                    heldKeys.add(event.code);
+                    updateMovementInput();
+                }
+            } else if (event.code === "Space") {
+                event.preventDefault();
+                if (!event.repeat) {
+                    sendHit();
+                }
+            }
+        });
+        window.addEventListener("keyup", (event) => {
+            if (keyLabels.has(event.code)) {
+                event.preventDefault();
+                heldKeys.delete(event.code);
+                updateMovementInput();
+            }
+        });
+
+        document.getElementById("start").addEventListener("click", async () => {
+            try {
+                const response = await fetch("/start", { method: "POST" });
+                if (!response.ok) throw new Error("start rejected");
+                heldKeys.clear();
+                lastSentMovement = "idle";
+                await pollState();
+            } catch (error) { setConnection(false); }
+        });
+        window.addEventListener("blur", () => {
+            heldKeys.clear();
+            updateMovementInput();
+        });
+        resizeCanvas();
+        pollState();
+        setInterval(pollState, 100);
+        requestAnimationFrame(drawFrame);
+    </script>
+</body>
+</html>
